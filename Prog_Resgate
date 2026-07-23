@@ -53,6 +53,9 @@ TEMPO_GIRO_70_GRAUS = 0.75
 # Recuo após soltar a vítima
 TEMPO_RECUO_SEG = 2.0        # Duração do afastamento em segundos
 
+# --- FILTRO DE PERSISTÊNCIA (SEGURANÇA) ---
+FRAMES_CONFIRMACAO_NECESSARIOS = 3
+
 # --- VARIÁVEIS GLOBAIS ---
 modelo_yolo = None
 camera = None
@@ -62,13 +65,16 @@ sensor_laser = None
 # --- MÁQUINA DE ESTADOS DO ROBÔ ---
 ciclo_atual = 1               # Vai de 1 a 3
 estado_atual = "PROCURAR_VITIMA"
+frames_confirmados_alvo = 0   # Contador de persistência em 3 frames
 
 
 def conectar_arduino():
     try:
         conexao = serial.Serial(PORTA_ARDUINO, BAUDRATE, timeout=1)
         time.sleep(2)
-        print("-> Arduino conectado com sucesso!")
+        # Limpa resíduos de boot na Serial para evitar interferência
+        conexao.reset_input_buffer()
+        print("-> Arduino conectado com sucesso e buffer limpo!")
         return conexao
     except Exception as e:
         print(f"-> FALHA ao conectar no Arduino: {e}")
@@ -86,6 +92,18 @@ def iniciar_vl53l0x():
         return None
 
 
+def ler_distancia_laser_segura():
+    """Lê o VL53L0X tratando possíveis exceções I2C para evitar crash no código"""
+    if sensor_laser is None:
+        return 9999
+    try:
+        dist = sensor_laser.range
+        return dist if dist > 0 else 9999
+    except Exception:
+        # Em caso de ruído elétrico na leitura, ignora sem travar o script
+        return 9999
+
+
 def enviar_comando_motores(vel_esquerda, vel_direita):
     """
     MODO RESGATE (Costas = Frente):
@@ -101,7 +119,10 @@ def enviar_comando_motores(vel_esquerda, vel_direita):
     comando = f"{vel_esq_final:.2f},{vel_dir_final:.2f}\n"
 
     if conexao_arduino and conexao_arduino.is_open:
-        conexao_arduino.write(comando.encode("utf-8"))
+        try:
+            conexao_arduino.write(comando.encode("utf-8"))
+        except Exception as e:
+            print(f"-> ERRO de escrita Serial: {e}")
         return vel_esq_final, vel_dir_final
     return 0.0, 0.0
 
@@ -109,9 +130,12 @@ def enviar_comando_motores(vel_esquerda, vel_direita):
 def executar_comando_garra(comando_texto):
     """Envia comandos de texto para acionar o braço/garra mecânica"""
     if conexao_arduino and conexao_arduino.is_open:
-        comando_formatado = f"{comando_texto}\n"
-        conexao_arduino.write(comando_formatado.encode("utf-8"))
-        print(f"-> Ação da Garra: {comando_texto}")
+        try:
+            comando_formatado = f"{comando_texto}\n"
+            conexao_arduino.write(comando_formatado.encode("utf-8"))
+            print(f"-> Ação da Garra: {comando_texto}")
+        except Exception as e:
+            print(f"-> ERRO de envio para a Garra: {e}")
 
 
 def detectar_linha_preta_tela_toda(frame):
@@ -163,11 +187,8 @@ def verificar_linha_preta_roi_topo(frame):
 
 
 def seguir_linha_final():
-    """
-    Acompanha a linha preta encontrada usando o KP proporcional prévio
-    por 1.5 segundos para garantir o encaixe no percurso.
-    """
-    print("-> Linha preta identificada na varredura! Iniciando seguidor KP na linha final...")
+    """Acompanha a linha preta encontrada usando o KP por 1.5 segundos"""
+    print("-> Linha preta identificada! Iniciando seguidor KP na linha final...")
     tempo_inicio = time.time()
     
     while (time.time() - tempo_inicio) < 1.5:
@@ -181,7 +202,6 @@ def seguir_linha_final():
             vel_dir = VEL_AVANCO_APROX + correcao_direcao
             enviar_comando_motores(vel_esq, vel_dir)
         else:
-            # Mantém avanço reto padrão se perder momentaneamente
             enviar_comando_motores(VEL_AVANCO_APROX, VEL_AVANCO_APROX)
         time.sleep(0.02)
         
@@ -199,13 +219,7 @@ def chamar_raspzits():
 
 
 def executar_varredura_70_graus():
-    """
-    1. Avança um pouco pra frente.
-    2. Vira 70° pra esquerda VERIFICANDO a faixa 20%-30%.
-    3. Se não achar: vira 70° pra direita SEM VERIFICAR (volta ao centro).
-    4. Vira 70° pra direita VERIFICANDO a faixa 20%-30%.
-    5. Ao achar a linha, anda usando o KP proporcional.
-    """
+    """Avança levemente e executa a varredura de 70° procurando a linha de saída"""
     print("-> Linha atingida! Avançando levemente...")
     enviar_comando_motores(0.3, 0.3)
     time.sleep(0.8)
@@ -218,7 +232,7 @@ def executar_varredura_70_graus():
     linha_encontrada = False
 
     while (time.time() - inicio_giro) < TEMPO_GIRO_70_GRAUS:
-        enviar_comando_motores(-VEL_GIRO_BUSCA, VEL_GIRO_BUSCA)  # Vira Esquerda
+        enviar_comando_motores(-VEL_GIRO_BUSCA, VEL_GIRO_BUSCA)
         frame = camera.capture_array()
         if verificar_linha_preta_roi_topo(frame) is not None:
             print("-> Linha preta confirmada na faixa 20%-30% (Esquerda)!")
@@ -230,9 +244,8 @@ def executar_varredura_70_graus():
 
     # 2. Se NÃO encontrou na esquerda:
     if not linha_encontrada:
-        print("-> Linha não encontrada na esquerda.")
         print("-> Retornando ao centro (70° pra direita SEM verificar)...")
-        enviar_comando_motores(VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA)  # Vira Direita
+        enviar_comando_motores(VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA)
         time.sleep(TEMPO_GIRO_70_GRAUS)
         enviar_comando_motores(0.0, 0.0)
         time.sleep(0.2)
@@ -242,7 +255,7 @@ def executar_varredura_70_graus():
         inicio_giro = time.time()
 
         while (time.time() - inicio_giro) < TEMPO_GIRO_70_GRAUS:
-            enviar_comando_motores(VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA)  # Vira Direita
+            enviar_comando_motores(VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA)
             frame = camera.capture_array()
             if verificar_linha_preta_roi_topo(frame) is not None:
                 print("-> Linha preta confirmada na faixa 20%-30% (Direita)!")
@@ -252,7 +265,6 @@ def executar_varredura_70_graus():
 
         enviar_comando_motores(0.0, 0.0)
 
-    # Se a linha foi achada em qualquer uma das varreduras, anda na linha com o KP
     if linha_encontrada:
         seguir_linha_final()
 
@@ -260,7 +272,7 @@ def executar_varredura_70_graus():
 
 
 def executar_loop_resgate():
-    global estado_atual, ciclo_atual
+    global estado_atual, ciclo_atual, frames_confirmados_alvo
     contador_frames = 0
     ultima_deteccao_yolo = {}
 
@@ -270,7 +282,7 @@ def executar_loop_resgate():
         frame = camera.capture_array()
         contador_frames += 1
 
-        # Processa a detecção com YOLO a cada 3 frames para economizar CPU
+        # Processa a detecção com YOLO a cada 3 frames para poupar a CPU
         if contador_frames % 3 == 0:
             ultima_deteccao_yolo = {}
             resultados = modelo_yolo.predict(frame, imgsz=320, conf=0.50, verbose=False)
@@ -297,18 +309,23 @@ def executar_loop_resgate():
             alvos_detectados[nome_classe] = centro_x
 
         vel_esq, vel_dir = 0.0, 0.0
-        distancia_laser_mm = sensor_laser.range if sensor_laser else 9999
+        distancia_laser_mm = ler_distancia_laser_segura()
 
         # --- CICLOS DE RESGATE (1 A 3) ---
         if ciclo_atual <= 3:
             alvo_vitima = "VViva" if ciclo_atual < 3 else "VMorta"
             alvo_area = "AreaViva" if ciclo_atual < 3 else "AreaMorta"
 
-            # 1. PROCURAR VÍTIMA
+            # 1. PROCURAR VÍTIMA (Com confirmação de 3 frames)
             if estado_atual == "PROCURAR_VITIMA":
                 if alvo_vitima in alvos_detectados:
-                    estado_atual = "ALINHAR_VITIMA"
+                    frames_confirmados_alvo += 1
+                    if frames_confirmados_alvo >= FRAMES_CONFIRMACAO_NECESSARIOS:
+                        print(f"-> Alvo {alvo_vitima} confirmado em {FRAMES_CONFIRMACAO_NECESSARIOS} frames!")
+                        estado_atual = "ALINHAR_VITIMA"
+                        frames_confirmados_alvo = 0
                 else:
+                    frames_confirmados_alvo = 0
                     vel_esq, vel_dir = VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA
 
             # 2. ALINHAR VÍTIMA
@@ -343,20 +360,27 @@ def executar_loop_resgate():
                 vel_esq, vel_dir = 0.0, 0.0
                 enviar_comando_motores(0, 0)
                 
+                print(f"-> Executando pegada da vítima ({alvo_vitima})...")
                 executar_comando_garra("GARRA_DESCER")
-                time.sleep(1.5)
+                time.sleep(1.2)
                 executar_comando_garra("GARRA_FECHAR")
                 time.sleep(1.0)
                 executar_comando_garra("GARRA_SUBIR")
-                time.sleep(1.5)
+                time.sleep(1.2)
                 
+                frames_confirmados_alvo = 0
                 estado_atual = "PROCURAR_AREA"
 
-            # 5. PROCURAR ÁREA
+            # 5. PROCURAR ÁREA (Com confirmação de 3 frames)
             elif estado_atual == "PROCURAR_AREA":
                 if alvo_area in alvos_detectados:
-                    estado_atual = "ALINHAR_AREA"
+                    frames_confirmados_alvo += 1
+                    if frames_confirmados_alvo >= FRAMES_CONFIRMACAO_NECESSARIOS:
+                        print(f"-> Área {alvo_area} confirmada em {FRAMES_CONFIRMACAO_NECESSARIOS} frames!")
+                        estado_atual = "ALINHAR_AREA"
+                        frames_confirmados_alvo = 0
                 else:
+                    frames_confirmados_alvo = 0
                     vel_esq, vel_dir = VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA
 
             # 6. ALINHAR ÁREA
@@ -391,8 +415,13 @@ def executar_loop_resgate():
                 vel_esq, vel_dir = 0.0, 0.0
                 enviar_comando_motores(0, 0)
                 
+                print(f"-> Soltando vítima ({alvo_area})...")
+                executar_comando_garra("GARRA_DESCER")
+                time.sleep(1.2)
                 executar_comando_garra("GARRA_ABRIR")
-                time.sleep(1.5)
+                time.sleep(1.0)
+                executar_comando_garra("GARRA_SUBIR")
+                time.sleep(1.2)
                 
                 estado_atual = "MARCHA_RE"
                 tempo_inicio_re = time.time()
@@ -404,6 +433,7 @@ def executar_loop_resgate():
                 else:
                     enviar_comando_motores(0, 0)
                     ciclo_atual += 1
+                    frames_confirmados_alvo = 0
                     if ciclo_atual <= 3:
                         estado_atual = "PROCURAR_VITIMA"
                     else:
@@ -437,7 +467,6 @@ def executar_loop_resgate():
                 vel_esq, vel_dir = 0.0, 0.0
                 enviar_comando_motores(0, 0)
                 
-                # Executa manobra de avanço + varredura + seguidor KP na linha final
                 executar_varredura_70_graus()
                 
                 estado_atual = "SAIDA_CONCLUIDA"
@@ -456,7 +485,6 @@ def executar_loop_resgate():
             chamar_raspzits()
             break
 
-        # Envia comandos de controle para os motores
         enviar_comando_motores(vel_esq, vel_dir)
 
 
