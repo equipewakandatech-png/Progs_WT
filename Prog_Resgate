@@ -1,0 +1,506 @@
+import os
+import sys
+import time
+import cv2
+import numpy as np
+import serial
+import board
+import busio
+import adafruit_vl53l0x
+from picamera2 import Picamera2
+from ultralytics import YOLO
+
+# --- CONFIGURAÇÕES DE HARDWARE ---
+PORTA_ARDUINO = "/dev/ttyACM0"
+BAUDRATE = 115200
+
+# --- CONFIGURAÇÕES DE VISÃO ---
+CAMINHO_MODELO = "best.pt"
+LARGURA_TELA = 320
+ALTURA_TELA = 240
+CENTRO_TELA_X = LARGURA_TELA / 2
+
+# Classes exatamente como no Roboflow
+CONFIANCA_MINIMA_YOLO = {
+    "VViva": 0.80,
+    "VMorta": 0.80,
+    "AreaViva": 0.75,
+    "AreaMorta": 0.75
+}
+
+# --- PARÂMETROS DE CONTROLE ---
+VEL_GIRO_BUSCA = 0.25      # Velocidade de rotação ao procurar alvos
+
+# Controle 1: Alinhamento Inicial (Giro sobre o próprio eixo)
+KP_GIRO = 0.005
+ZONA_MORTA_PX = 6
+VEL_BASE_GIRO = 0.15
+
+# Controle 2: Aproximação e Seguidor de Linha Final
+VEL_AVANCO_APROX = 0.35    
+KP_DIRECAO_APROX = 0.002   
+
+# Distâncias do Sensor Laser VL53L0X
+DIST_PARADA_VITIMA_MM = 80   # Parada a 8cm da vítima
+DIST_PARADA_AREA_MM = 40     # Parada a 4cm da área
+
+# Parada da Saída (Eixo Y na Tela)
+Y_MAX_PARADA_SAIDA = 200  
+
+# Tempo estimado para girar aprox. 70 graus
+TEMPO_GIRO_70_GRAUS = 0.75  
+
+# Recuo após soltar a vítima
+TEMPO_RECUO_SEG = 2.0        # Duração do afastamento em segundos
+
+# --- VARIÁVEIS GLOBAIS ---
+modelo_yolo = None
+camera = None
+conexao_arduino = None
+sensor_laser = None
+
+# --- MÁQUINA DE ESTADOS DO ROBÔ ---
+ciclo_atual = 1               # Vai de 1 a 3
+estado_atual = "PROCURAR_VITIMA"
+
+
+def conectar_arduino():
+    try:
+        conexao = serial.Serial(PORTA_ARDUINO, BAUDRATE, timeout=1)
+        time.sleep(2)
+        print("-> Arduino conectado com sucesso!")
+        return conexao
+    except Exception as e:
+        print(f"-> FALHA ao conectar no Arduino: {e}")
+        return None
+
+
+def iniciar_vl53l0x():
+    try:
+        barramento_i2c = busio.I2C(board.SCL, board.SDA)
+        sensor = adafruit_vl53l0x.VL53L0X(barramento_i2c)
+        print("-> Sensor VL53L0X inicializado com sucesso!")
+        return sensor
+    except Exception as e:
+        print(f"-> FALHA ao inicializar o sensor VL53L0X: {e}")
+        return None
+
+
+def enviar_comando_motores(vel_esquerda, vel_direita):
+    """
+    MODO RESGATE (Costas = Frente):
+    Inverte o sinal e troca E/D para que os comandos da câmera traseira 
+    movam o robô no sentido físico correto da garra.
+    """
+    vel_esq_invertida = -vel_direita
+    vel_dir_invertida = -vel_esquerda
+
+    vel_esq_final = max(-1.0, min(1.0, vel_esq_invertida))
+    vel_dir_final = max(-1.0, min(1.0, vel_dir_invertida))
+    
+    comando = f"{vel_esq_final:.2f},{vel_dir_final:.2f}\n"
+
+    if conexao_arduino and conexao_arduino.is_open:
+        conexao_arduino.write(comando.encode("utf-8"))
+        return vel_esq_final, vel_dir_final
+    return 0.0, 0.0
+
+
+def executar_comando_garra(comando_texto):
+    """Envia comandos de texto para acionar o braço/garra mecânica"""
+    if conexao_arduino and conexao_arduino.is_open:
+        comando_formatado = f"{comando_texto}\n"
+        conexao_arduino.write(comando_formatado.encode("utf-8"))
+        print(f"-> Ação da Garra: {comando_texto}")
+
+
+def detectar_linha_preta_tela_toda(frame):
+    """Detecta linha preta em toda a tela (para aproximação inicial)"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask_preta = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    contornos, _ = cv2.findContours(mask_preta, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    centro_x_global = None
+    centro_y_global = None
+    area_linha = 0
+
+    if contornos:
+        c = max(contornos, key=cv2.contourArea)
+        area_linha = cv2.contourArea(c)
+        if area_linha > 300:
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                centro_x_global = int(M["m10"] / M["m00"])
+                centro_y_global = int(M["m01"] / M["m00"])
+
+    return centro_x_global, centro_y_global, area_linha
+
+
+def verificar_linha_preta_roi_topo(frame):
+    """
+    Verifica presença de linha preta estritamente na faixa 20% a 30% do topo da tela.
+    Retorna o centro X da linha se encontrada, ou None se não encontrar.
+    """
+    h, w = frame.shape[:2]
+    roi_y1 = int(h * 0.20)
+    roi_y2 = int(h * 0.30)
+    
+    zona_roi = frame[roi_y1:roi_y2, :]
+    gray = cv2.cvtColor(zona_roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    _, mask_preta = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    contornos, _ = cv2.findContours(mask_preta, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contornos:
+        c = max(contornos, key=cv2.contourArea)
+        if cv2.contourArea(c) > 150:
+            M = cv2.moments(c)
+            if M["m00"] != 0:
+                return int(M["m10"] / M["m00"])
+    return None
+
+
+def seguir_linha_final():
+    """
+    Acompanha a linha preta encontrada usando o KP proporcional prévio
+    por 1.5 segundos para garantir o encaixe no percurso.
+    """
+    print("-> Linha preta identificada na varredura! Iniciando seguidor KP na linha final...")
+    tempo_inicio = time.time()
+    
+    while (time.time() - tempo_inicio) < 1.5:
+        frame = camera.capture_array()
+        cx_linha = verificar_linha_preta_roi_topo(frame)
+        
+        if cx_linha is not None:
+            erro_x = CENTRO_TELA_X - cx_linha
+            correcao_direcao = erro_x * KP_DIRECAO_APROX
+            vel_esq = VEL_AVANCO_APROX - correcao_direcao
+            vel_dir = VEL_AVANCO_APROX + correcao_direcao
+            enviar_comando_motores(vel_esq, vel_dir)
+        else:
+            # Mantém avanço reto padrão se perder momentaneamente
+            enviar_comando_motores(VEL_AVANCO_APROX, VEL_AVANCO_APROX)
+        time.sleep(0.02)
+        
+    enviar_comando_motores(0.0, 0.0)
+
+
+def chamar_raspzits():
+    """Finaliza periféricos e chama o script de percurso raspzits.py"""
+    print("-> Encerrando resgatezits.py e voltando para o percurso (raspzits.py)...")
+    encerrar_sistema()
+    time.sleep(1.0)
+    
+    python_bin = sys.executable
+    os.execv(python_bin, [python_bin, "raspzits.py"])
+
+
+def executar_varredura_70_graus():
+    """
+    1. Avança um pouco pra frente.
+    2. Vira 70° pra esquerda VERIFICANDO a faixa 20%-30%.
+    3. Se não achar: vira 70° pra direita SEM VERIFICAR (volta ao centro).
+    4. Vira 70° pra direita VERIFICANDO a faixa 20%-30%.
+    5. Ao achar a linha, anda usando o KP proporcional.
+    """
+    print("-> Linha atingida! Avançando levemente...")
+    enviar_comando_motores(0.3, 0.3)
+    time.sleep(0.8)
+    enviar_comando_motores(0.0, 0.0)
+    time.sleep(0.2)
+
+    # 1. Girando 70° para a ESQUERDA VERIFICANDO
+    print("-> Varrendo 70° para a ESQUERDA (verificando)...")
+    inicio_giro = time.time()
+    linha_encontrada = False
+
+    while (time.time() - inicio_giro) < TEMPO_GIRO_70_GRAUS:
+        enviar_comando_motores(-VEL_GIRO_BUSCA, VEL_GIRO_BUSCA)  # Vira Esquerda
+        frame = camera.capture_array()
+        if verificar_linha_preta_roi_topo(frame) is not None:
+            print("-> Linha preta confirmada na faixa 20%-30% (Esquerda)!")
+            linha_encontrada = True
+            break
+        time.sleep(0.02)
+
+    enviar_comando_motores(0.0, 0.0)
+
+    # 2. Se NÃO encontrou na esquerda:
+    if not linha_encontrada:
+        print("-> Linha não encontrada na esquerda.")
+        print("-> Retornando ao centro (70° pra direita SEM verificar)...")
+        enviar_comando_motores(VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA)  # Vira Direita
+        time.sleep(TEMPO_GIRO_70_GRAUS)
+        enviar_comando_motores(0.0, 0.0)
+        time.sleep(0.2)
+
+        # 3. Girando 70° para a DIREITA VERIFICANDO
+        print("-> Varrendo 70° para a DIREITA (verificando)...")
+        inicio_giro = time.time()
+
+        while (time.time() - inicio_giro) < TEMPO_GIRO_70_GRAUS:
+            enviar_comando_motores(VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA)  # Vira Direita
+            frame = camera.capture_array()
+            if verificar_linha_preta_roi_topo(frame) is not None:
+                print("-> Linha preta confirmada na faixa 20%-30% (Direita)!")
+                linha_encontrada = True
+                break
+            time.sleep(0.02)
+
+        enviar_comando_motores(0.0, 0.0)
+
+    # Se a linha foi achada em qualquer uma das varreduras, anda na linha com o KP
+    if linha_encontrada:
+        seguir_linha_final()
+
+    return linha_encontrada
+
+
+def executar_loop_resgate():
+    global estado_atual, ciclo_atual
+    contador_frames = 0
+    ultima_deteccao_yolo = {}
+
+    print("-> Iniciando máquina de estados do resgate autônomo (resgatezits.py)...")
+
+    while True:
+        frame = camera.capture_array()
+        contador_frames += 1
+
+        # Processa a detecção com YOLO a cada 3 frames para economizar CPU
+        if contador_frames % 3 == 0:
+            ultima_deteccao_yolo = {}
+            resultados = modelo_yolo.predict(frame, imgsz=320, conf=0.50, verbose=False)
+
+            for resultado in resultados:
+                for caixa in resultado.boxes:
+                    classe_id = int(caixa.cls[0])
+                    nome_classe = modelo_yolo.names[classe_id]
+                    confianca = float(caixa.conf[0])
+
+                    if nome_classe not in CONFIANCA_MINIMA_YOLO or confianca < CONFIANCA_MINIMA_YOLO[nome_classe]:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, caixa.xyxy[0])
+                    ultima_deteccao_yolo[nome_classe] = {
+                        "confianca": confianca,
+                        "caixa": (x1, y1, x2, y2)
+                    }
+
+        alvos_detectados = {}
+        for nome_classe, dados in ultima_deteccao_yolo.items():
+            x1, y1, x2, y2 = dados["caixa"]
+            centro_x = int((x1 + x2) / 2)
+            alvos_detectados[nome_classe] = centro_x
+
+        vel_esq, vel_dir = 0.0, 0.0
+        distancia_laser_mm = sensor_laser.range if sensor_laser else 9999
+
+        # --- CICLOS DE RESGATE (1 A 3) ---
+        if ciclo_atual <= 3:
+            alvo_vitima = "VViva" if ciclo_atual < 3 else "VMorta"
+            alvo_area = "AreaViva" if ciclo_atual < 3 else "AreaMorta"
+
+            # 1. PROCURAR VÍTIMA
+            if estado_atual == "PROCURAR_VITIMA":
+                if alvo_vitima in alvos_detectados:
+                    estado_atual = "ALINHAR_VITIMA"
+                else:
+                    vel_esq, vel_dir = VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA
+
+            # 2. ALINHAR VÍTIMA
+            elif estado_atual == "ALINHAR_VITIMA":
+                if alvo_vitima in alvos_detectados:
+                    erro_x = CENTRO_TELA_X - alvos_detectados[alvo_vitima]
+                    if abs(erro_x) > ZONA_MORTA_PX:
+                        correcao_giro = erro_x * KP_GIRO
+                        sinal = np.sign(correcao_giro)
+                        correcao_final = correcao_giro + (sinal * VEL_BASE_GIRO)
+                        vel_esq, vel_dir = -correcao_final, correcao_final
+                    else:
+                        estado_atual = "APROXIMAR_VITIMA"
+                else:
+                    estado_atual = "PROCURAR_VITIMA"
+
+            # 3. APROXIMAR VÍTIMA
+            elif estado_atual == "APROXIMAR_VITIMA":
+                if distancia_laser_mm <= DIST_PARADA_VITIMA_MM:
+                    enviar_comando_motores(0, 0)
+                    estado_atual = "PEGAR_VITIMA"
+                elif alvo_vitima in alvos_detectados:
+                    erro_x = CENTRO_TELA_X - alvos_detectados[alvo_vitima]
+                    correcao_direcao = erro_x * KP_DIRECAO_APROX
+                    vel_esq = VEL_AVANCO_APROX - correcao_direcao
+                    vel_dir = VEL_AVANCO_APROX + correcao_direcao
+                else:
+                    estado_atual = "PROCURAR_VITIMA"
+
+            # 4. PEGAR VÍTIMA
+            elif estado_atual == "PEGAR_VITIMA":
+                vel_esq, vel_dir = 0.0, 0.0
+                enviar_comando_motores(0, 0)
+                
+                executar_comando_garra("GARRA_DESCER")
+                time.sleep(1.5)
+                executar_comando_garra("GARRA_FECHAR")
+                time.sleep(1.0)
+                executar_comando_garra("GARRA_SUBIR")
+                time.sleep(1.5)
+                
+                estado_atual = "PROCURAR_AREA"
+
+            # 5. PROCURAR ÁREA
+            elif estado_atual == "PROCURAR_AREA":
+                if alvo_area in alvos_detectados:
+                    estado_atual = "ALINHAR_AREA"
+                else:
+                    vel_esq, vel_dir = VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA
+
+            # 6. ALINHAR ÁREA
+            elif estado_atual == "ALINHAR_AREA":
+                if alvo_area in alvos_detectados:
+                    erro_x = CENTRO_TELA_X - alvos_detectados[alvo_area]
+                    if abs(erro_x) > ZONA_MORTA_PX:
+                        correcao_giro = erro_x * KP_GIRO
+                        sinal = np.sign(correcao_giro)
+                        correcao_final = correcao_giro + (sinal * VEL_BASE_GIRO)
+                        vel_esq, vel_dir = -correcao_final, correcao_final
+                    else:
+                        estado_atual = "APROXIMAR_AREA"
+                else:
+                    estado_atual = "PROCURAR_AREA"
+
+            # 7. APROXIMAR ÁREA
+            elif estado_atual == "APROXIMAR_AREA":
+                if distancia_laser_mm <= DIST_PARADA_AREA_MM:
+                    enviar_comando_motores(0, 0)
+                    estado_atual = "SOLTAR_VITIMA"
+                elif alvo_area in alvos_detectados:
+                    erro_x = CENTRO_TELA_X - alvos_detectados[alvo_area]
+                    correcao_direcao = erro_x * KP_DIRECAO_APROX
+                    vel_esq = VEL_AVANCO_APROX - correcao_direcao
+                    vel_dir = VEL_AVANCO_APROX + correcao_direcao
+                else:
+                    estado_atual = "PROCURAR_AREA"
+
+            # 8. SOLTAR VÍTIMA
+            elif estado_atual == "SOLTAR_VITIMA":
+                vel_esq, vel_dir = 0.0, 0.0
+                enviar_comando_motores(0, 0)
+                
+                executar_comando_garra("GARRA_ABRIR")
+                time.sleep(1.5)
+                
+                estado_atual = "MARCHA_RE"
+                tempo_inicio_re = time.time()
+
+            # 9. MARCHA RÉ
+            elif estado_atual == "MARCHA_RE":
+                if time.time() - tempo_inicio_re < TEMPO_RECUO_SEG:
+                    vel_esq, vel_dir = -VEL_AVANCO_APROX, -VEL_AVANCO_APROX
+                else:
+                    enviar_comando_motores(0, 0)
+                    ciclo_atual += 1
+                    if ciclo_atual <= 3:
+                        estado_atual = "PROCURAR_VITIMA"
+                    else:
+                        estado_atual = "PROCURAR_SAIDA"
+
+        # --- ESTADO FINAL: SAÍDA LINHA PRETA ---
+        elif estado_atual == "PROCURAR_SAIDA":
+            centro_x_saida, centro_y_saida, area_saida = detectar_linha_preta_tela_toda(frame)
+            if centro_x_saida is not None:
+                estado_atual = "ALINHAR_SAIDA"
+            else:
+                vel_esq, vel_dir = VEL_GIRO_BUSCA, -VEL_GIRO_BUSCA
+
+        elif estado_atual == "ALINHAR_SAIDA":
+            centro_x_saida, centro_y_saida, area_saida = detectar_linha_preta_tela_toda(frame)
+            if centro_x_saida is not None:
+                erro_x = CENTRO_TELA_X - centro_x_saida
+                if abs(erro_x) > ZONA_MORTA_PX:
+                    correcao_giro = erro_x * KP_GIRO
+                    sinal = np.sign(correcao_giro)
+                    correcao_final = correcao_giro + (sinal * VEL_BASE_GIRO)
+                    vel_esq, vel_dir = -correcao_final, correcao_final
+                else:
+                    estado_atual = "APROXIMAR_SAIDA"
+            else:
+                estado_atual = "PROCURAR_SAIDA"
+
+        elif estado_atual == "APROXIMAR_SAIDA":
+            centro_x_saida, centro_y_saida, area_saida = detectar_linha_preta_tela_toda(frame)
+            if centro_y_saida is not None and centro_y_saida >= Y_MAX_PARADA_SAIDA:
+                vel_esq, vel_dir = 0.0, 0.0
+                enviar_comando_motores(0, 0)
+                
+                # Executa manobra de avanço + varredura + seguidor KP na linha final
+                executar_varredura_70_graus()
+                
+                estado_atual = "SAIDA_CONCLUIDA"
+            elif centro_x_saida is not None:
+                erro_x = CENTRO_TELA_X - centro_x_saida
+                correcao_direcao = erro_x * KP_DIRECAO_APROX
+                vel_esq = VEL_AVANCO_APROX - correcao_direcao
+                vel_dir = VEL_AVANCO_APROX + correcao_direcao
+            else:
+                estado_atual = "PROCURAR_SAIDA"
+
+        elif estado_atual == "SAIDA_CONCLUIDA":
+            vel_esq, vel_dir = 0.0, 0.0
+            enviar_comando_motores(0, 0)
+            print("-> RESGATE CONCLUÍDO COM SUCESSO!")
+            chamar_raspzits()
+            break
+
+        # Envia comandos de controle para os motores
+        enviar_comando_motores(vel_esq, vel_dir)
+
+
+def iniciar():
+    global modelo_yolo, camera, conexao_arduino, sensor_laser
+
+    if not os.path.exists(CAMINHO_MODELO):
+        print("-> ERRO: Modelo YOLO não encontrado!")
+        return False
+
+    conexao_arduino = conectar_arduino()
+    sensor_laser = iniciar_vl53l0x()
+
+    print("-> Carregando modelo YOLO...")
+    modelo_yolo = YOLO(CAMINHO_MODELO)
+
+    print("-> Iniciando Pi Camera...")
+    camera = Picamera2()
+
+    configuracao = camera.create_preview_configuration(
+        main={"size": (LARGURA_TELA, ALTURA_TELA), "format": "RGB888"}
+    )
+    camera.configure(configuracao)
+    camera.start()
+
+    time.sleep(2)
+    print("-> Mapeamento concluído! Módulo de resgate pronto.")
+    return True
+
+
+def encerrar_sistema():
+    print("-> Encerrando resgate e parando motores...")
+    enviar_comando_motores(0, 0)
+    if conexao_arduino and conexao_arduino.is_open:
+        conexao_arduino.close()
+    if camera:
+        camera.stop()
+
+
+if __name__ == "__main__":
+    try:
+        if iniciar():
+            executar_loop_resgate()
+    except KeyboardInterrupt:
+        print("-> Resgate interrompido pelo usuário.")
+    finally:
+        encerrar_sistema()
