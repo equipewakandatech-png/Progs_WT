@@ -1,0 +1,154 @@
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <Servo.h>
+
+// ============================================================================
+// >>> CONFIGURAÇÃO DE PINOS (ALTERE AQUI QUANDO O HARDWARE ESTIVER PRONTO) <<<
+// ============================================================================
+
+// --- MOTORES (Ponte H / L298N / TB6612FNG) ---
+const int PIN_IN1 = 4;   // Direção Motor Esquerdo A
+const int PIN_IN2 = 5;   // Direção Motor Esquerdo B
+const int PIN_ENA = 6;   // Velocidade Motor Esquerdo (PWM)
+
+const int PIN_IN3 = 7;   // Direção Motor Direito A
+const int PIN_IN4 = 8;   // Direção Motor Direito B
+const int PIN_ENB = 3;   // Velocidade Motor Direito (PWM) -> Mudado para 3 para liberar o 9 e 10 aos servos
+
+// --- SERVOS DA GARRA ---
+const int PIN_SERVO_BRACO = 10; // Servo do Braço (Subir / Descer)
+const int PIN_SERVO_PINCA = 11; // Servo da Pinça (Abrir / Fechar)
+
+// ============================================================================
+// >>> ÂNGULOS DOS SERVOS (AJUSTE CONFORME A MECÂNICA NA HORA DOS TESTES) <<<
+// ============================================================================
+const int ANGULO_BRACO_ALTO  = 160; // Braço recolhido/subido
+const int ANGULO_BRACO_BAIXO = 30;  // Braço abaixado para pegar bola
+
+const int ANGULO_PINCA_ABERTA = 40;  // Pinça aberta para envolver a bola
+const int ANGULO_PINCA_FECHADA = 120; // Pinça fechada segurando a bola
+
+// ============================================================================
+
+VL53L0X sensor;
+bool sensorPronto = false;
+
+Servo servoBraco;
+Servo servoPinca;
+
+unsigned long ultimoEnvioSensor = 0;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { ; } // Aguarda a conexão USB no Uno R4
+
+  Wire.begin();
+
+  // Configuração dos Pinos dos Motores
+  pinMode(PIN_IN1, OUTPUT);
+  pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_ENA, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT);
+  pinMode(PIN_IN4, OUTPUT);
+  pinMode(PIN_ENB, OUTPUT);
+
+  // Inicialização dos Servos
+  servoBraco.attach(PIN_SERVO_BRACO);
+  servoPinca.attach(PIN_SERVO_PINCA);
+
+  // Posição Inicial Neutra (Braço no alto e pinça aberta)
+  servoBraco.write(ANGULO_BRACO_ALTO);
+  servoPinca.write(ANGULO_PINCA_ABERTA);
+
+  // Inicialização do Sensor VL53L0X
+  sensor.setTimeout(500);
+  if (!sensor.init()) {
+    Serial.println(999);
+    sensorPronto = false;
+  } else {
+    sensor.startContinuous();
+    sensor.setMeasurementTimingBudget(20000); // 20ms
+    sensorPronto = true;
+  }
+}
+
+void loop() {
+  // 1. PROCESSAR COMANDOS SERIAL VINDO DO PYTHON
+  if (Serial.available() > 0) {
+    String comando = Serial.readStringUntil('\n');
+    comando.trim();
+
+    // --- COMANDOS DOS SERVOS (MECÂNICA DO RESGATE) ---
+    if (comando == "GARRA_DESCER") {
+      servoBraco.write(ANGULO_BRACO_BAIXO);
+    } 
+    else if (comando == "GARRA_SUBIR") {
+      servoBraco.write(ANGULO_BRACO_ALTO);
+    } 
+    else if (comando == "GARRA_FECHAR") {
+      servoPinca.write(ANGULO_PINCA_FECHADA);
+    } 
+    else if (comando == "GARRA_ABRIR") {
+      servoPinca.write(ANGULO_PINCA_ABERTA);
+    }
+    // --- COMANDO DOS MOTORES (VELOCIDADE) ---
+    else if (comando.indexOf(',') != -1) {
+      int virgulaIndex = comando.indexOf(',');
+      float vel_esq = comando.substring(0, virgulaIndex).toFloat();
+      float vel_dir = comando.substring(virgulaIndex + 1).toFloat();
+
+      controlarMotores(vel_esq, vel_dir);
+    }
+  }
+
+  // 2. ENVIAR DISTÂNCIA DO TOF A CADA 50MS
+  if (millis() - ultimoEnvioSensor >= 50) {
+    ultimoEnvioSensor = millis();
+    int distancia_cm = 999;
+
+    if (sensorPronto) {
+      int leitura_mm = sensor.readRangeContinuousMillimeters();
+      
+      if (!sensor.timeoutOccurred()) {
+        distancia_cm = leitura_mm / 10;
+      }
+
+      if (distancia_cm > 80 || distancia_cm <= 1) {
+        distancia_cm = 999;
+      }
+    }
+    Serial.println(distancia_cm);
+  }
+}
+
+// Função auxiliar para aplicar velocidades nos motores
+void controlarMotores(float vel_esq, float vel_dir) {
+  int pwm_esq = constrain(abs((int)(vel_esq * 255)), 0, 255);
+  int pwm_dir = constrain(abs((int)(vel_dir * 255)), 0, 255);
+
+  // Motor Esquerdo
+  if (vel_esq > 0) {
+    digitalWrite(PIN_IN1, HIGH);
+    digitalWrite(PIN_IN2, LOW);
+  } else if (vel_esq < 0) {
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, HIGH);
+  } else {
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, LOW);
+  }
+  analogWrite(PIN_ENA, pwm_esq);
+
+  // Motor Direito
+  if (vel_dir > 0) {
+    digitalWrite(PIN_IN3, HIGH);
+    digitalWrite(PIN_IN4, LOW);
+  } else if (vel_dir < 0) {
+    digitalWrite(PIN_IN3, LOW);
+    digitalWrite(PIN_IN4, HIGH);
+  } else {
+    digitalWrite(PIN_IN3, LOW);
+    digitalWrite(PIN_IN4, LOW);
+  }
+  analogWrite(PIN_ENB, pwm_dir);
+}
