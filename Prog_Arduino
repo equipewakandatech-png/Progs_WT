@@ -13,7 +13,7 @@ const int PIN_ENA = 6;   // Velocidade Motor Esquerdo (PWM)
 
 const int PIN_IN3 = 7;   // Direção Motor Direito A
 const int PIN_IN4 = 8;   // Direção Motor Direito B
-const int PIN_ENB = 3;   // Velocidade Motor Direito (PWM) -> Liberado dos pinos 9/10/11
+const int PIN_ENB = 3;   // Velocidade Motor Direito (PWM)
 
 // --- SERVOS DA GARRA (Colunas G-V-S da Sensor Shield) ---
 const int PIN_SERVO_BRACO = 10; // Coluna 10 (Servo do Braço - Subir/Descer)
@@ -29,6 +29,12 @@ const int ANGULO_PINCA_ABERTA  = 40;  // Pinça aberta
 const int ANGULO_PINCA_FECHADA = 120; // Pinça fechada segurando a bola
 
 // ============================================================================
+// >>> TRAVA DE SEGURANÇA (WATCHDOG DE SOFTWARE) <<<
+// ============================================================================
+unsigned long ultimaComunicacao = 0;
+const unsigned long TIMEOUT_SEGURANCA_MS = 1000; // Desliga motores após 1s sem comandos
+
+// ============================================================================
 
 VL53L0X sensor;
 bool sensorPronto = false;
@@ -40,7 +46,7 @@ unsigned long ultimoEnvioSensor = 0;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { ; } // Aguarda inicialização da USB no Uno R4
+  while (!Serial) { ; } // Aguarda inicialização da USB
 
   Wire.begin();
 
@@ -52,7 +58,7 @@ void setup() {
   pinMode(PIN_IN4, OUTPUT);
   pinMode(PIN_ENB, OUTPUT);
 
-  // Inicialização e Associação dos Servos aos Pinos
+  // Inicialização dos Servos
   servoBraco.attach(PIN_SERVO_BRACO);
   servoPinca.attach(PIN_SERVO_PINCA);
 
@@ -70,11 +76,15 @@ void setup() {
     sensor.setMeasurementTimingBudget(20000); // 20ms por leitura
     sensorPronto = true;
   }
+
+  ultimaComunicacao = millis();
 }
 
 void loop() {
   // 1. LEITURA DE COMANDOS DA SERIAL (Python -> Arduino)
   if (Serial.available() > 0) {
+    ultimaComunicacao = millis(); // Reseta o cronômetro do Watchdog
+    
     String comando = Serial.readStringUntil('\n');
     comando.trim();
 
@@ -101,7 +111,13 @@ void loop() {
     }
   }
 
-  // 2. ENVIO DA DISTÂNCIA DO TOF PARA O PYTHON (A CADA 50MS)
+  // 2. TIMEOUT DE SEGURANÇA (Watchdog)
+  // Se passar de 1 segundo sem receber nenhum sinal do Python, para o robô imediatamente
+  if (millis() - ultimaComunicacao > TIMEOUT_SEGURANCA_MS) {
+    controlarMotores(0.0, 0.0);
+  }
+
+  // 3. ENVIO DA DISTÂNCIA DO TOF PARA O PYTHON (A CADA 50MS)
   if (millis() - ultimoEnvioSensor >= 50) {
     ultimoEnvioSensor = millis();
     int distancia_cm = 999;
