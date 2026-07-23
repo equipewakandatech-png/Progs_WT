@@ -3,29 +3,29 @@
 #include <Servo.h>
 
 // ============================================================================
-// >>> CONFIGURAÇÃO DE PINOS (ALTERE AQUI QUANDO O HARDWARE ESTIVER PRONTO) <<<
+// >>> CONFIGURAÇÃO DE PINOS (EDITÁVEL) <<<
 // ============================================================================
 
-// --- MOTORES (Ponte H / L298N / TB6612FNG) ---
+// --- MOTORES (Ponte H) ---
 const int PIN_IN1 = 4;   // Direção Motor Esquerdo A
 const int PIN_IN2 = 5;   // Direção Motor Esquerdo B
 const int PIN_ENA = 6;   // Velocidade Motor Esquerdo (PWM)
 
 const int PIN_IN3 = 7;   // Direção Motor Direito A
 const int PIN_IN4 = 8;   // Direção Motor Direito B
-const int PIN_ENB = 3;   // Velocidade Motor Direito (PWM) -> Mudado para 3 para liberar o 9 e 10 aos servos
+const int PIN_ENB = 3;   // Velocidade Motor Direito (PWM) -> Liberado dos pinos 9/10/11
 
-// --- SERVOS DA GARRA ---
-const int PIN_SERVO_BRACO = 10; // Servo do Braço (Subir / Descer)
-const int PIN_SERVO_PINCA = 11; // Servo da Pinça (Abrir / Fechar)
+// --- SERVOS DA GARRA (Colunas G-V-S da Sensor Shield) ---
+const int PIN_SERVO_BRACO = 10; // Coluna 10 (Servo do Braço - Subir/Descer)
+const int PIN_SERVO_PINCA = 11; // Coluna 11 (Servo da Pinça - Abrir/Fechar)
 
 // ============================================================================
-// >>> ÂNGULOS DOS SERVOS (AJUSTE CONFORME A MECÂNICA NA HORA DOS TESTES) <<<
+// >>> ÂNGULOS DOS SERVOS (AJUSTAR DE ACORDO COM A MECÂNICA) <<<
 // ============================================================================
-const int ANGULO_BRACO_ALTO  = 160; // Braço recolhido/subido
-const int ANGULO_BRACO_BAIXO = 30;  // Braço abaixado para pegar bola
+const int ANGULO_BRACO_ALTO   = 160; // Braço recolhido/subido
+const int ANGULO_BRACO_BAIXO  = 30;  // Braço abaixado para pegar bola
 
-const int ANGULO_PINCA_ABERTA = 40;  // Pinça aberta para envolver a bola
+const int ANGULO_PINCA_ABERTA  = 40;  // Pinça aberta
 const int ANGULO_PINCA_FECHADA = 120; // Pinça fechada segurando a bola
 
 // ============================================================================
@@ -40,7 +40,7 @@ unsigned long ultimoEnvioSensor = 0;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) { ; } // Aguarda a conexão USB no Uno R4
+  while (!Serial) { ; } // Aguarda inicialização da USB no Uno R4
 
   Wire.begin();
 
@@ -52,33 +52,33 @@ void setup() {
   pinMode(PIN_IN4, OUTPUT);
   pinMode(PIN_ENB, OUTPUT);
 
-  // Inicialização dos Servos
+  // Inicialização e Associação dos Servos aos Pinos
   servoBraco.attach(PIN_SERVO_BRACO);
   servoPinca.attach(PIN_SERVO_PINCA);
 
-  // Posição Inicial Neutra (Braço no alto e pinça aberta)
+  // Posição Inicial de Repouso (Braço no alto e pinça aberta)
   servoBraco.write(ANGULO_BRACO_ALTO);
   servoPinca.write(ANGULO_PINCA_ABERTA);
 
-  // Inicialização do Sensor VL53L0X
+  // Inicialização do Sensor Laser TOF VL53L0X
   sensor.setTimeout(500);
   if (!sensor.init()) {
     Serial.println(999);
     sensorPronto = false;
   } else {
     sensor.startContinuous();
-    sensor.setMeasurementTimingBudget(20000); // 20ms
+    sensor.setMeasurementTimingBudget(20000); // 20ms por leitura
     sensorPronto = true;
   }
 }
 
 void loop() {
-  // 1. PROCESSAR COMANDOS SERIAL VINDO DO PYTHON
+  // 1. LEITURA DE COMANDOS DA SERIAL (Python -> Arduino)
   if (Serial.available() > 0) {
     String comando = Serial.readStringUntil('\n');
     comando.trim();
 
-    // --- COMANDOS DOS SERVOS (MECÂNICA DO RESGATE) ---
+    // --- COMANDOS DOS SERVOS (MECÂNICA) ---
     if (comando == "GARRA_DESCER") {
       servoBraco.write(ANGULO_BRACO_BAIXO);
     } 
@@ -91,7 +91,7 @@ void loop() {
     else if (comando == "GARRA_ABRIR") {
       servoPinca.write(ANGULO_PINCA_ABERTA);
     }
-    // --- COMANDO DOS MOTORES (VELOCIDADE) ---
+    // --- COMANDO DOS MOTORES (Ex: "0.35,-0.35") ---
     else if (comando.indexOf(',') != -1) {
       int virgulaIndex = comando.indexOf(',');
       float vel_esq = comando.substring(0, virgulaIndex).toFloat();
@@ -101,7 +101,7 @@ void loop() {
     }
   }
 
-  // 2. ENVIAR DISTÂNCIA DO TOF A CADA 50MS
+  // 2. ENVIO DA DISTÂNCIA DO TOF PARA O PYTHON (A CADA 50MS)
   if (millis() - ultimoEnvioSensor >= 50) {
     ultimoEnvioSensor = millis();
     int distancia_cm = 999;
@@ -121,7 +121,7 @@ void loop() {
   }
 }
 
-// Função auxiliar para aplicar velocidades nos motores
+// Função auxiliar para acionamento dos motores
 void controlarMotores(float vel_esq, float vel_dir) {
   int pwm_esq = constrain(abs((int)(vel_esq * 255)), 0, 255);
   int pwm_dir = constrain(abs((int)(vel_dir * 255)), 0, 255);
