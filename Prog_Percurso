@@ -6,6 +6,7 @@ import threading
 import subprocess
 import os
 import sys
+from picamera2 import Picamera2  # Usando PiCamera no percurso
 
 # >>> 1. CONSTANTES E CONFIGURAÇÕES
 LARGURA = 640
@@ -17,7 +18,7 @@ K_AGRESSIVO = 0.00002
 FRAMES_NECESSARIOS = 3
 AREA_MINIMA_VERDE = 600
 PIXELS_MINIMOS_VERMELHO = 1000  
-AREA_MINIMA_CINZA = 800  # Área mínima para confirmar o cinza
+AREA_MINIMA_CINZA = 800  
 FONTE = cv2.FONT_HERSHEY_PLAIN
 
 # Paleta de Cores BGR
@@ -39,7 +40,7 @@ UPPER_RED1 = np.array([10, 255, 255])
 LOWER_RED2 = np.array([170, 70, 50])
 UPPER_RED2 = np.array([180, 255, 255])
 
-# HSV do Cinza Ajustado para Luz Branca Intensa vinda de cima
+# HSV do Cinza
 LOWER_GREY = np.array([0, 0, 80])     
 UPPER_GREY = np.array([180, 35, 255]) 
 
@@ -57,7 +58,7 @@ distancia_obstaculo = 999
 
 # >>> 2. CONEXÃO SERIAL GLOBAL E THREAD DE LEITURA
 ser_global = None
-rodando_serial = True  # Flag para encerrar a thread de leitura da serial
+rodando_serial = True  
 
 def thread_ler_serial():
     global distancia_obstaculo, ser_global, rodando_serial
@@ -84,10 +85,13 @@ def thread_ler_serial():
 serial_worker = threading.Thread(target=thread_ler_serial, daemon=True)
 serial_worker.start()
 
-# >>> 3. CONTROLE DE VÍDEO E ARDUINO
-camera = cv2.VideoCapture(0)
-camera.set(cv2.CAP_PROP_FRAME_WIDTH, LARGURA)
-camera.set(cv2.CAP_PROP_FRAME_HEIGHT, ALTURA)
+# >>> 3. CONTROLE DE VÍDEO (PICAMERA2) E ARDUINO
+camera = Picamera2()
+configuracao = camera.create_preview_configuration(
+    main={"size": (LARGURA, ALTURA), "format": "BGR888"}
+)
+camera.configure(configuracao)
+camera.start()
 
 def enviar_comando(vel_esq, vel_dir):
     global ser_global
@@ -108,21 +112,18 @@ def chamar_resgatezits():
     print("-> Parando motores e liberando periféricos para o resgate...")
     enviar_comando(0.0, 0.0)
     
-    # 1. Encerra a thread de leitura serial
     rodando_serial = False
     time.sleep(0.3)
     
-    # 2. Fecha a conexão serial para não bloquear o resgatezits.py
     if ser_global and ser_global.is_open:
         ser_global.close()
         ser_global = None
 
-    # 3. Libera a câmera frontal do percurso
-    camera.release()
+    # Parando a Picamera2
+    camera.stop()
     time.sleep(1.0)
     
     print("-> Invocando resgatezits.py e encerrando raspzits.py...")
-    # 4. Substitui totalmente o processo do raspzits.py pelo resgatezits.py
     python_bin = sys.executable
     os.execv(python_bin, [python_bin, "resgatezits.py"])
 
@@ -154,10 +155,8 @@ def manobra_90(direcao):
     time.sleep(0.6)
     enviar_comando(0.0, 0.0)
 
-# MANOBRA: ENTRADA RESGATE (CINZA) - AVANÇA 30CM E CHAMA O RESGATEZITS.PY
 def executar_entrada_resgate():
     print("-> Entrada da sala de resgate detectada! Avançando 30cm...")
-
     enviar_comando(0.0, 0.0)
     time.sleep(0.2)
 
@@ -179,7 +178,6 @@ def processar_frame(frame):
     frame = frame.copy()
     h, w, _ = frame.shape
     status = "SIGA"
-    cor_txt = AMARELO
     acao_imediata = False
     vel_esq_final = VEL_BASE
     vel_dir_final = VEL_BASE
@@ -193,13 +191,11 @@ def processar_frame(frame):
         fps = int(1 / (current_time - prev_time))
     prev_time = current_time
 
-    # ROI Dimensões Calculadas Dinamicamente
     x_inicio_guia = (w // 2) - int((w * 0.20) / 2)
     x_fim_guia = (w // 2) + int((w * 0.20) / 2)
     altura_linha_guia = int(h * 0.20)
     roi_verde_y1, roi_verde_y2 = int(h * 0.40), int(h * 0.65)
     
-    # ROI DO CINZA (30% a 40% de baixo para cima)
     roi_cinza_y1 = int(h * 0.60)
     roi_cinza_y2 = int(h * 0.70)
     
@@ -208,7 +204,6 @@ def processar_frame(frame):
     posicao_linha_amarela = int(h * 0.66)
     cx_suave = w // 2
 
-    # GATILHO PRIORITÁRIO DO ULTRASSÔNICO DO ARDUINO
     if distancia_obstaculo < 30: 
         status = f"OBSTACULO: {distancia_obstaculo}cm - PARADO"
         executar_desvio_obstaculo()
@@ -216,7 +211,6 @@ def processar_frame(frame):
         memoria_centro_cx.clear()
         return
 
-    # DETECÇÃO DA LINHA CINZA (ENTRADA RESGATE)
     zona_cinza = frame[roi_cinza_y1:roi_cinza_y2, :]
     hsv_cinza = cv2.cvtColor(zona_cinza, cv2.COLOR_BGR2HSV)
     mask_cinza = cv2.inRange(hsv_cinza, LOWER_GREY, UPPER_GREY)
@@ -232,7 +226,6 @@ def processar_frame(frame):
     else:
         frames_cinza = max(0, frames_cinza - 1)
 
-    # VERMELHO
     roi_vermelho_y2 = h
     zona_vermelho = frame[roi_vermelho_y1:roi_vermelho_y2, :]
     hsv_vermelho = cv2.cvtColor(zona_vermelho, cv2.COLOR_BGR2HSV)
@@ -254,7 +247,6 @@ def processar_frame(frame):
             vel_dir_final = 0
             frames_vermelho = FRAMES_NECESSARIOS
 
-    # LINHA PRETA
     zona_linha = frame[roi_linha_y1:roi_linha_y2, :]
     gray = cv2.cvtColor(zona_linha, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -277,7 +269,6 @@ def processar_frame(frame):
         else:
             memoria_centro_cx.clear()
 
-    # INTERSEÇÃO HORIZONTAL
     roi_horizontal_y1 = posicao_linha_amarela
     roi_horizontal_y2 = posicao_linha_amarela + 2
     zona_horizontal = frame[roi_horizontal_y1:roi_horizontal_y2, :]
@@ -296,7 +287,6 @@ def processar_frame(frame):
                 linha_preta_horizontal_detectada = True
                 break
 
-    # LINHA GUIA SUPERIOR
     zona_rosa = frame[altura_linha_guia:altura_linha_guia + 2, x_inicio_guia:x_fim_guia]
     gray_rosa = cv2.cvtColor(zona_rosa, cv2.COLOR_BGR2GRAY)
     _, mask_rosa = cv2.threshold(gray_rosa, 65, 255, cv2.THRESH_BINARY_INV)
@@ -308,7 +298,6 @@ def processar_frame(frame):
             linha_guia_confirmada = True
             break
 
-    # VERDES
     zona_verde = frame[roi_verde_y1:roi_verde_y2, :]
     hsv_verde = cv2.cvtColor(zona_verde, cv2.COLOR_BGR2HSV)
     mask_verde = cv2.inRange(hsv_verde, LOWER_GREEN, UPPER_GREEN)
@@ -328,7 +317,6 @@ def processar_frame(frame):
                         vx = int(Mv["m10"] / Mv["m00"])
                         verdes_validos.append(vx)
 
-    # FILTROS E DECISÃO
     if not acao_imediata:
         if frames_cinza >= FRAMES_NECESSARIOS:
             status = "ENTRADA RESGATE (CINZA)"
@@ -391,7 +379,6 @@ def processar_frame(frame):
             vel_esq_final = VEL_BASE * 0.7
             vel_dir_final = VEL_BASE * 0.7
 
-    # EXECUÇÃO DAS MANOBRAS DE PRIORIDADE
     if executar_resgate:
         print(f"-> Status: ENTRADA RESGATE")
         executar_entrada_resgate()
@@ -414,17 +401,13 @@ def processar_frame(frame):
         memoria_centro_cx.clear()
         return
 
-    # Envia comando normal de navegação
     enviar_comando(vel_esq_final, vel_dir_final)
-
 
 # >>> 5. LOOP PRINCIPAL AUTÔNOMO
 def rodar_navegacao():
-    print("-> Robô iniciado em modo autônomo (raspzits.py)!")
+    print("-> Robô iniciado em modo autônomo (raspzits.py - PiCamera)!")
     while True:
-        success, frame = camera.read()
-        if not success:
-            continue
+        frame = camera.capture_array()  # Captura do array de imagem via Picamera2
         processar_frame(frame)
 
 if __name__ == "__main__":
@@ -434,4 +417,4 @@ if __name__ == "__main__":
         print("-> Navegação interrompida manualmente.")
     finally:
         enviar_comando(0.0, 0.0)
-        camera.release()
+        camera.stop()
