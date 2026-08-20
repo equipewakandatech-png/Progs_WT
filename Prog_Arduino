@@ -6,8 +6,11 @@
 // >>> CONFIGURAÇÃO DE PINOS (EDITÁVEL) <<<
 // ============================================================================
 
+// --- RELÉ / LED ---
+const int PIN_RELE = 4; // Pino do Relé que liga o LED
+
 // --- MOTORES (Ponte H) ---
-const int PIN_IN1 = 4;   // Direção Motor Esquerdo A
+const int PIN_IN1 = 4;   // Direção Motor Esquerdo A (Atenção se pino 4 conflitar com o relé)
 const int PIN_IN2 = 5;   // Direção Motor Esquerdo B
 const int PIN_ENA = 6;   // Velocidade Motor Esquerdo (PWM)
 
@@ -45,6 +48,10 @@ Servo servoPinca;
 unsigned long ultimoEnvioSensor = 0;
 
 void setup() {
+  // LIGA O RELÉ/LED IMEDIATAMENTE (LOW ativa a maioria dos relés)
+  pinMode(PIN_RELE, OUTPUT);
+  digitalWrite(PIN_RELE, LOW);
+
   Serial.begin(115200);
   while (!Serial) { ; } // Aguarda inicialização da USB
 
