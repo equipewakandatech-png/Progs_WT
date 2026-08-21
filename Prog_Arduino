@@ -1,177 +1,249 @@
-#include <Wire.h>
-#include <VL53L0X.h>
 #include <Servo.h>
 
 // ============================================================================
-// >>> CONFIGURAÇÃO DE PINOS (EDITÁVEL) <<<
+// WAKANDA TECH - OBR 2026
+// ARDUINO UNO R4 WIFI - CONTROLE DE 4 MOTORES / 2 DRIVERS
+// Protocolo Serial: "vel_esq,vel_dir" em -1.00..1.00
+// Comandos extras: STOP, LED_ON, LED_OFF, GARRA_DESCER, GARRA_SUBIR,
+//                 GARRA_FECHAR, GARRA_ABRIR, PING
 // ============================================================================
 
-// --- RELÉ / LED ---
-const int PIN_RELE = 4; // Pino do Relé que liga o LED
+// --------------------------- CONFIGURAÇÃO GERAL -----------------------------
+const unsigned long BAUDRATE = 115200;
+const unsigned long TIMEOUT_SEGURANCA_MS = 1000;
 
-// --- MOTORES (Ponte H) ---
-const int PIN_IN1 = 4;   // Direção Motor Esquerdo A (Atenção se pino 4 conflitar com o relé)
-const int PIN_IN2 = 5;   // Direção Motor Esquerdo B
-const int PIN_ENA = 6;   // Velocidade Motor Esquerdo (PWM)
+// Relé / LED
+const int PIN_RELE = 4;
+const bool RELE_ATIVO_EM_LOW = true;
+const bool LIGAR_LED_AO_INICIAR = true;
 
-const int PIN_IN3 = 7;   // Direção Motor Direito A
-const int PIN_IN4 = 8;   // Direção Motor Direito B
-const int PIN_ENB = 3;   // Velocidade Motor Direito (PWM)
+// Servos ainda não instalados: deixe false até a mecânica confirmar.
+const bool USAR_SERVOS = false;
+const int PIN_SERVO_BRACO = 10;
+const int PIN_SERVO_PINCA = A3;
 
-// --- SERVOS DA GARRA (Colunas G-V-S da Sensor Shield) ---
-const int PIN_SERVO_BRACO = 10; // Coluna 10 (Servo do Braço - Subir/Descer)
-const int PIN_SERVO_PINCA = 11; // Coluna 11 (Servo da Pinça - Abrir/Fechar)
+const int ANGULO_BRACO_ALTO = 160;
+const int ANGULO_BRACO_BAIXO = 30;
+const int ANGULO_PINCA_ABERTA = 40;
+const int ANGULO_PINCA_FECHADA = 120;
 
-// ============================================================================
-// >>> ÂNGULOS DOS SERVOS (AJUSTAR DE ACORDO COM A MECÂNICA) <<<
-// ============================================================================
-const int ANGULO_BRACO_ALTO   = 160; // Braço recolhido/subido
-const int ANGULO_BRACO_BAIXO  = 30;  // Braço abaixado para pegar bola
+// ------------------------------- DRIVER 1 -----------------------------------
+// OUT1/OUT2 -> TRASEIRO ESQUERDO
+const int D1_ENA = 3;
+const int D1_IN1 = 2;
+const int D1_IN2 = 6;
 
-const int ANGULO_PINCA_ABERTA  = 40;  // Pinça aberta
-const int ANGULO_PINCA_FECHADA = 120; // Pinça fechada segurando a bola
+// OUT3/OUT4 -> TRASEIRO DIREITO
+const int D1_IN3 = 7;
+const int D1_IN4 = 8;
+const int D1_ENB = 5;
 
-// ============================================================================
-// >>> TRAVA DE SEGURANÇA (WATCHDOG DE SOFTWARE) <<<
-// ============================================================================
+// ------------------------------- DRIVER 2 -----------------------------------
+// OUT1/OUT2 -> FRENTE DIREITA
+const int D2_ENA = 9;
+const int D2_IN1 = 12;
+const int D2_IN2 = A2;
+
+// OUT3/OUT4 -> FRENTE ESQUERDA
+const int D2_IN3 = A0;
+const int D2_IN4 = A1;
+const int D2_ENB = 11;
+
+// Se UM motor girar ao contrário durante o teste, altere apenas o respectivo
+// false para true. Não troque a lógica do Python por causa de polaridade física.
+const bool INVERTER_FRENTE_ESQ = false;
+const bool INVERTER_TRAS_ESQ   = false;
+const bool INVERTER_FRENTE_DIR = false;
+const bool INVERTER_TRAS_DIR   = false;
+
+// Limita a potência máxima enviada aos drivers (255 = 100%).
+// Pode ser reduzido durante calibração, sem alterar o Python.
+const int PWM_MAXIMO = 255;
+
+// ----------------------------------------------------------------------------
 unsigned long ultimaComunicacao = 0;
-const unsigned long TIMEOUT_SEGURANCA_MS = 1000; // Desliga motores após 1s sem comandos
-
-// ============================================================================
-
-VL53L0X sensor;
-bool sensorPronto = false;
+bool watchdogJaParou = false;
 
 Servo servoBraco;
 Servo servoPinca;
 
-unsigned long ultimoEnvioSensor = 0;
+// ============================================================================
+// FUNÇÕES AUXILIARES
+// ============================================================================
 
-void setup() {
-  // LIGA O RELÉ/LED IMEDIATAMENTE (LOW ativa a maioria dos relés)
-  pinMode(PIN_RELE, OUTPUT);
-  digitalWrite(PIN_RELE, LOW);
+void escreverRele(bool ligado) {
+  bool nivelAtivo = RELE_ATIVO_EM_LOW ? LOW : HIGH;
+  bool nivelInativo = RELE_ATIVO_EM_LOW ? HIGH : LOW;
+  digitalWrite(PIN_RELE, ligado ? nivelAtivo : nivelInativo);
+}
 
-  Serial.begin(115200);
-  while (!Serial) { ; } // Aguarda inicialização da USB
+void configurarPinoMotor(int ena, int in1, int in2) {
+  pinMode(ena, OUTPUT);
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  analogWrite(ena, 0);
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+}
 
-  Wire.begin();
+void acionarMotor(int ena, int in1, int in2, float velocidade, bool inverter) {
+  if (inverter) velocidade = -velocidade;
 
-  // Configuração dos Pinos dos Motores
-  pinMode(PIN_IN1, OUTPUT);
-  pinMode(PIN_IN2, OUTPUT);
-  pinMode(PIN_ENA, OUTPUT);
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
-  pinMode(PIN_ENB, OUTPUT);
+  velocidade = constrain(velocidade, -1.0f, 1.0f);
+  int pwm = (int)(fabs(velocidade) * PWM_MAXIMO);
+  pwm = constrain(pwm, 0, PWM_MAXIMO);
 
-  // Inicialização dos Servos
-  servoBraco.attach(PIN_SERVO_BRACO);
-  servoPinca.attach(PIN_SERVO_PINCA);
-
-  // Posição Inicial de Repouso (Braço no alto e pinça aberta)
-  servoBraco.write(ANGULO_BRACO_ALTO);
-  servoPinca.write(ANGULO_PINCA_ABERTA);
-
-  // Inicialização do Sensor Laser TOF VL53L0X
-  sensor.setTimeout(500);
-  if (!sensor.init()) {
-    Serial.println(999);
-    sensorPronto = false;
+  if (velocidade > 0.001f) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    analogWrite(ena, pwm);
+  } else if (velocidade < -0.001f) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    analogWrite(ena, pwm);
   } else {
-    sensor.startContinuous();
-    sensor.setMeasurementTimingBudget(20000); // 20ms por leitura
-    sensorPronto = true;
+    // Coast/parada: PWM zerado e ambos sinais baixos.
+    analogWrite(ena, 0);
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+}
+
+void controlarMotores(float velEsq, float velDir) {
+  velEsq = constrain(velEsq, -1.0f, 1.0f);
+  velDir = constrain(velDir, -1.0f, 1.0f);
+
+  // LADO ESQUERDO
+  acionarMotor(D2_ENB, D2_IN3, D2_IN4, velEsq, INVERTER_FRENTE_ESQ);
+  acionarMotor(D1_ENA, D1_IN1, D1_IN2, velEsq, INVERTER_TRAS_ESQ);
+
+  // LADO DIREITO
+  acionarMotor(D2_ENA, D2_IN1, D2_IN2, velDir, INVERTER_FRENTE_DIR);
+  acionarMotor(D1_ENB, D1_IN3, D1_IN4, velDir, INVERTER_TRAS_DIR);
+}
+
+void pararMotores() {
+  controlarMotores(0.0f, 0.0f);
+}
+
+bool parsearVelocidades(const String &comando, float &velEsq, float &velDir) {
+  int virgula = comando.indexOf(',');
+  if (virgula <= 0 || virgula >= (int)comando.length() - 1) return false;
+
+  String esquerda = comando.substring(0, virgula);
+  String direita = comando.substring(virgula + 1);
+  esquerda.trim();
+  direita.trim();
+
+  // toFloat() retorna 0 em strings inválidas. Para evitar aceitar lixo como 0,0,
+  // exigimos ao menos algum caractere típico de número em cada campo.
+  if (esquerda.length() == 0 || direita.length() == 0) return false;
+  bool esqPareceNumero = esquerda.indexOf('.') >= 0 || esquerda.indexOf('-') >= 0 || isDigit(esquerda[0]);
+  bool dirPareceNumero = direita.indexOf('.') >= 0 || direita.indexOf('-') >= 0 || isDigit(direita[0]);
+  if (!esqPareceNumero || !dirPareceNumero) return false;
+
+  velEsq = constrain(esquerda.toFloat(), -1.0f, 1.0f);
+  velDir = constrain(direita.toFloat(), -1.0f, 1.0f);
+  return true;
+}
+
+void processarComando(String comando) {
+  comando.trim();
+  if (comando.length() == 0) return;
+
+  // Qualquer comando válido recebido do Raspberry mantém o watchdog vivo.
+  ultimaComunicacao = millis();
+  watchdogJaParou = false;
+
+  if (comando == "STOP") {
+    pararMotores();
+    return;
   }
 
+  if (comando == "PING") {
+    Serial.println("PONG");
+    return;
+  }
+
+  if (comando == "LED_ON") {
+    escreverRele(true);
+    return;
+  }
+
+  if (comando == "LED_OFF") {
+    escreverRele(false);
+    return;
+  }
+
+  if (comando == "GARRA_DESCER") {
+    if (USAR_SERVOS) servoBraco.write(ANGULO_BRACO_BAIXO);
+    return;
+  }
+
+  if (comando == "GARRA_SUBIR") {
+    if (USAR_SERVOS) servoBraco.write(ANGULO_BRACO_ALTO);
+    return;
+  }
+
+  if (comando == "GARRA_FECHAR") {
+    if (USAR_SERVOS) servoPinca.write(ANGULO_PINCA_FECHADA);
+    return;
+  }
+
+  if (comando == "GARRA_ABRIR") {
+    if (USAR_SERVOS) servoPinca.write(ANGULO_PINCA_ABERTA);
+    return;
+  }
+
+  float velEsq = 0.0f;
+  float velDir = 0.0f;
+  if (parsearVelocidades(comando, velEsq, velDir)) {
+    controlarMotores(velEsq, velDir);
+  }
+}
+
+// ============================================================================
+// SETUP / LOOP
+// ============================================================================
+
+void setup() {
+  // Segurança: configure e pare todos os motores antes de qualquer outra coisa.
+  configurarPinoMotor(D1_ENA, D1_IN1, D1_IN2);
+  configurarPinoMotor(D1_ENB, D1_IN3, D1_IN4);
+  configurarPinoMotor(D2_ENA, D2_IN1, D2_IN2);
+  configurarPinoMotor(D2_ENB, D2_IN3, D2_IN4);
+  pararMotores();
+
+  pinMode(PIN_RELE, OUTPUT);
+  escreverRele(LIGAR_LED_AO_INICIAR);
+
+  if (USAR_SERVOS) {
+    servoBraco.attach(PIN_SERVO_BRACO);
+    servoPinca.attach(PIN_SERVO_PINCA);
+    servoBraco.write(ANGULO_BRACO_ALTO);
+    servoPinca.write(ANGULO_PINCA_ABERTA);
+  }
+
+  Serial.begin(BAUDRATE);
+  Serial.setTimeout(25);
+
+  // Não usamos while(!Serial): o Arduino precisa inicializar sozinho no robô,
+  // mesmo que o Raspberry ainda esteja terminando o boot.
   ultimaComunicacao = millis();
 }
 
 void loop() {
-  // 1. LEITURA DE COMANDOS DA SERIAL (Python -> Arduino)
   if (Serial.available() > 0) {
-    ultimaComunicacao = millis(); // Reseta o cronômetro do Watchdog
-    
     String comando = Serial.readStringUntil('\n');
-    comando.trim();
-
-    // --- COMANDOS DOS SERVOS (MECÂNICA) ---
-    if (comando == "GARRA_DESCER") {
-      servoBraco.write(ANGULO_BRACO_BAIXO);
-    } 
-    else if (comando == "GARRA_SUBIR") {
-      servoBraco.write(ANGULO_BRACO_ALTO);
-    } 
-    else if (comando == "GARRA_FECHAR") {
-      servoPinca.write(ANGULO_PINCA_FECHADA);
-    } 
-    else if (comando == "GARRA_ABRIR") {
-      servoPinca.write(ANGULO_PINCA_ABERTA);
-    }
-    // --- COMANDO DOS MOTORES (Ex: "0.35,-0.35") ---
-    else if (comando.indexOf(',') != -1) {
-      int virgulaIndex = comando.indexOf(',');
-      float vel_esq = comando.substring(0, virgulaIndex).toFloat();
-      float vel_dir = comando.substring(virgulaIndex + 1).toFloat();
-
-      controlarMotores(vel_esq, vel_dir);
-    }
+    processarComando(comando);
   }
 
-  // 2. TIMEOUT DE SEGURANÇA (Watchdog)
-  // Se passar de 1 segundo sem receber nenhum sinal do Python, para o robô imediatamente
+  // Se o Raspberry travar, fechar o processo ou o cabo USB cair, os quatro
+  // motores são parados automaticamente.
   if (millis() - ultimaComunicacao > TIMEOUT_SEGURANCA_MS) {
-    controlarMotores(0.0, 0.0);
-  }
-
-  // 3. ENVIO DA DISTÂNCIA DO TOF PARA O PYTHON (A CADA 50MS)
-  if (millis() - ultimoEnvioSensor >= 50) {
-    ultimoEnvioSensor = millis();
-    int distancia_cm = 999;
-
-    if (sensorPronto) {
-      int leitura_mm = sensor.readRangeContinuousMillimeters();
-      
-      if (!sensor.timeoutOccurred()) {
-        distancia_cm = leitura_mm / 10;
-      }
-
-      if (distancia_cm > 80 || distancia_cm <= 1) {
-        distancia_cm = 999;
-      }
+    if (!watchdogJaParou) {
+      pararMotores();
+      watchdogJaParou = true;
     }
-    Serial.println(distancia_cm);
   }
-}
-
-// Função auxiliar para acionamento dos motores
-void controlarMotores(float vel_esq, float vel_dir) {
-  int pwm_esq = constrain(abs((int)(vel_esq * 255)), 0, 255);
-  int pwm_dir = constrain(abs((int)(vel_dir * 255)), 0, 255);
-
-  // Motor Esquerdo
-  if (vel_esq > 0) {
-    digitalWrite(PIN_IN1, HIGH);
-    digitalWrite(PIN_IN2, LOW);
-  } else if (vel_esq < 0) {
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, HIGH);
-  } else {
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, LOW);
-  }
-  analogWrite(PIN_ENA, pwm_esq);
-
-  // Motor Direito
-  if (vel_dir > 0) {
-    digitalWrite(PIN_IN3, HIGH);
-    digitalWrite(PIN_IN4, LOW);
-  } else if (vel_dir < 0) {
-    digitalWrite(PIN_IN3, LOW);
-    digitalWrite(PIN_IN4, HIGH);
-  } else {
-    digitalWrite(PIN_IN3, LOW);
-    digitalWrite(PIN_IN4, LOW);
-  }
-  analogWrite(PIN_ENB, pwm_dir);
 }
